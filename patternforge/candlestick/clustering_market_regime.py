@@ -2585,3 +2585,736 @@ class ClusteringMarketRegimeAnalyzer:
                 
         except ImportError:
             self.logger.warning("Could not plot regime timeline. matplotlib required.")
+            
+    """
+Enhanced features for ClusteringMarketRegimeAnalyzer:
+1. Model validation
+2. Hyperparameter optimization
+3. Comparative analysis
+"""
+
+    def validate_model(self, 
+                    test_start_date: Optional[pd.Timestamp] = None,
+                    test_end_date: Optional[pd.Timestamp] = None,
+                    validation_metric: str = 'silhouette',
+                    n_splits: int = 5) -> Dict[str, float]:
+        """
+        Validate regime detection model using time-series cross-validation
+        
+        Args:
+            test_start_date (Optional[pd.Timestamp]): Start date for test period
+            test_end_date (Optional[pd.Timestamp]): End date for test period
+            validation_metric (str): Metric to use for validation ('silhouette', 'calinski_harabasz', 'stability')
+            n_splits (int): Number of validation splits
+            
+        Returns:
+            Dict[str, float]: Validation metrics
+        """
+        self.logger.info(f"Validating model using {validation_metric} with {n_splits} splits")
+        
+        # Set default test period if not provided
+        if test_start_date is None or test_end_date is None:
+            # Use last 20% of data for testing
+            data_length = len(self.df)
+            split_idx = int(data_length * 0.8)
+            train_df = self.df.iloc[:split_idx]
+            test_df = self.df.iloc[split_idx:]
+            
+            test_start_date = test_df.index[0]
+            test_end_date = test_df.index[-1]
+        else:
+            # Use provided dates
+            train_df = self.df[self.df.index < test_start_date]
+            test_df = self.df[(self.df.index >= test_start_date) & (self.df.index <= test_end_date)]
+        
+        if len(test_df) < 30:  # Require at least 30 days for testing
+            self.logger.warning("Test period too short for validation, need at least 30 days")
+            return {}
+        
+        self.logger.info(f"Validation period: {test_start_date.date()} to {test_end_date.date()}")
+        
+        # Store original config
+        original_config = self.config
+        
+        # Perform time-series cross-validation
+        metrics = {
+            'silhouette_scores': [],
+            'calinski_harabasz_scores': [],
+            'stability_scores': [],
+            'prediction_consistency': []
+        }
+        
+        # Calculate time ranges for splits
+        test_range = (test_end_date - test_start_date).days
+        split_days = test_range // n_splits
+        
+        # Create time splits
+        splits = []
+        for i in range(n_splits):
+            split_start = test_start_date + pd.Timedelta(days=i*split_days)
+            split_end = test_start_date + pd.Timedelta(days=(i+1)*split_days)
+            if i == n_splits - 1:  # Ensure last split goes to end
+                split_end = test_end_date
+            splits.append((split_start, split_end))
+        
+        # Train on all data before test period
+        train_regimes = self.detect_regimes(
+            start_date=train_df.index[0],
+            end_date=train_df.index[-1],
+            force_recompute=True
+        )
+        
+        # Get clusters at end of training period to use as initial state
+        last_clusters = {}
+        if train_regimes:
+            last_regime = train_regimes[-1]
+            last_clusters = {
+                'regime_type': last_regime.regime_type,
+                'cluster_id': last_regime.cluster_id,
+                'feature_vector': last_regime.feature_vector
+            }
+        
+        # For each split, detect regimes and evaluate
+        all_predictions = []
+        
+        for i, (split_start, split_end) in enumerate(splits):
+            self.logger.info(f"Validation split {i+1}/{n_splits}: {split_start.date()} to {split_end.date()}")
+            
+            # Detect regimes for this split
+            split_regimes = self.detect_regimes(
+                start_date=split_start,
+                end_date=split_end,
+                force_recompute=True
+            )
+            
+            # Calculate validation metrics
+            if split_regimes:
+                # Calculate silhouette score if requested
+                if validation_metric == 'silhouette' or 'all' in validation_metric:
+                    if hasattr(self, 'silhouette_avg') and self.silhouette_avg is not None:
+                        metrics['silhouette_scores'].append(self.silhouette_avg)
+                
+                # Calculate Calinski-Harabasz score if requested
+                if validation_metric == 'calinski_harabasz' or 'all' in validation_metric:
+                    if hasattr(self, 'ch_score') and self.ch_score is not None:
+                        metrics['calinski_harabasz_scores'].append(self.ch_score)
+                
+                # Calculate cluster stability if requested
+                if validation_metric == 'stability' or 'all' in validation_metric:
+                    if hasattr(self, 'cluster_stability'):
+                        avg_stability = np.mean(list(self.cluster_stability.values()))
+                        metrics['stability_scores'].append(avg_stability)
+                
+                # Store regime predictions
+                split_predictions = []
+                for date in self.df[(self.df.index >= split_start) & 
+                                (self.df.index <= split_end)].index:
+                    # Find regime for this date
+                    for regime in split_regimes:
+                        if regime.start_date <= date <= regime.end_date:
+                            split_predictions.append((date, regime.regime_type))
+                            break
+                
+                all_predictions.append(split_predictions)
+        
+        # Calculate prediction consistency across splits
+        if len(all_predictions) > 1:
+            # Find dates present in all predictions
+            common_dates = set()
+            for split_preds in all_predictions:
+                split_dates = set(date for date, _ in split_preds)
+                if not common_dates:
+                    common_dates = split_dates
+                else:
+                    common_dates &= split_dates
+            
+            if common_dates:
+                # Calculate consistency for each common date
+                consistency_scores = []
+                for date in common_dates:
+                    predictions = []
+                    for split_preds in all_predictions:
+                        for pred_date, regime_type in split_preds:
+                            if pred_date == date:
+                                predictions.append(regime_type)
+                                break
+                    
+                    # Calculate consistency as ratio of most common prediction
+                    if predictions:
+                        most_common = Counter(predictions).most_common(1)[0]
+                        consistency = most_common[1] / len(predictions)
+                        consistency_scores.append(consistency)
+                
+                if consistency_scores:
+                    metrics['prediction_consistency'] = np.mean(consistency_scores)
+        
+        # Calculate average metrics
+        validation_results = {}
+        for metric, values in metrics.items():
+            if values:  # Only include non-empty metrics
+                validation_results[metric] = np.mean(values)
+        
+        # Restore original configuration
+        self.config = original_config
+        
+        self.logger.info(f"Validation results: {validation_results}")
+        return validation_results
+
+    def optimize_hyperparameters(self, 
+                            param_grid: Dict[str, List[Any]] = None,
+                            metric: str = 'silhouette',
+                            n_trials: int = 10,
+                            optimization_method: str = 'grid',
+                            validation_splits: int = 3) -> Dict[str, Any]:
+        """
+        Optimize clustering hyperparameters using grid or random search
+        
+        Args:
+            param_grid (Dict[str, List[Any]]): Parameters to optimize
+            metric (str): Metric to optimize ('silhouette', 'calinski_harabasz', 'stability')
+            n_trials (int): Number of random trials (for random search)
+            optimization_method (str): 'grid' or 'random'
+            validation_splits (int): Number of validation splits for each parameter set
+            
+        Returns:
+            Dict[str, Any]: Best hyperparameters and their performance
+        """
+        self.logger.info(f"Optimizing hyperparameters using {optimization_method} search")
+        
+        # Default parameter grid if none provided
+        if param_grid is None:
+            param_grid = {
+                'cluster_method': ['kmeans', 'gmm', 'dbscan'],
+                'n_clusters': [3, 5, 7, 9],
+                'use_pca': [True, False],
+                'pca_components': [5, 10, 15]
+            }
+        
+        # Store original config
+        original_config = self.config
+        
+        # Function to evaluate a parameter set
+        def evaluate_params(params):
+            # Create new config with these parameters
+            eval_config = ClusteringConfig(**{**vars(original_config), **params})
+            
+            # Update analyzer with new config
+            self.config = eval_config
+            
+            # Validate model
+            validation_results = self.validate_model(
+                validation_metric=metric,
+                n_splits=validation_splits
+            )
+            
+            # Extract the target metric
+            if f'{metric}_scores' in validation_results:
+                score = validation_results[f'{metric}_scores']
+            elif metric == 'prediction_consistency' and 'prediction_consistency' in validation_results:
+                score = validation_results['prediction_consistency']
+            else:
+                score = 0.0
+                
+            return score, validation_results
+        
+        # Perform optimization
+        results = []
+        
+        if optimization_method == 'grid':
+            # Generate all parameter combinations
+            import itertools
+            param_keys = list(param_grid.keys())
+            param_values = list(param_grid.values())
+            param_combinations = list(itertools.product(*param_values))
+            
+            for combination in param_combinations:
+                params = dict(zip(param_keys, combination))
+                self.logger.info(f"Evaluating parameters: {params}")
+                
+                score, validation_results = evaluate_params(params)
+                
+                results.append({
+                    'params': params,
+                    'score': score,
+                    'validation_results': validation_results
+                })
+        
+        elif optimization_method == 'random':
+            # Random parameter search
+            import random
+            
+            for _ in range(n_trials):
+                # Sample random parameters
+                params = {}
+                for param_name, param_values in param_grid.items():
+                    params[param_name] = random.choice(param_values)
+                
+                self.logger.info(f"Evaluating parameters: {params}")
+                
+                score, validation_results = evaluate_params(params)
+                
+                results.append({
+                    'params': params,
+                    'score': score,
+                    'validation_results': validation_results
+                })
+        
+        else:
+            self.logger.error(f"Unknown optimization method: {optimization_method}")
+            return {}
+        
+        # Find best parameters
+        if results:
+            best_result = max(results, key=lambda x: x['score'])
+            best_params = best_result['params']
+            best_score = best_result['score']
+            
+            self.logger.info(f"Best parameters: {best_params}, Score: {best_score}")
+            
+            # Restore original config
+            self.config = original_config
+            
+            return {
+                'best_params': best_params,
+                'best_score': best_score,
+                'all_results': results
+            }
+        else:
+            self.logger.warning("No valid results found during hyperparameter optimization")
+            return {}
+
+    def compare_clustering_methods(self, 
+                                methods: List[str] = None,
+                                n_clusters: int = 5,
+                                validation_metric: str = 'silhouette',
+                                start_date: Optional[pd.Timestamp] = None,
+                                end_date: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+        """
+        Compare different clustering methods on the same dataset
+        
+        Args:
+            methods (List[str]): List of clustering methods to compare
+            n_clusters (int): Number of clusters to use
+            validation_metric (str): Metric for comparison
+            start_date (Optional[pd.Timestamp]): Start date for analysis
+            end_date (Optional[pd.Timestamp]): End date for analysis
+            
+        Returns:
+            pd.DataFrame: Comparison results
+        """
+        self.logger.info("Comparing clustering methods")
+        
+        # Default methods if none provided
+        if methods is None:
+            methods = ['kmeans', 'gmm', 'dbscan', 'hierarchical']
+        
+        # Store original config
+        original_config = self.config
+        
+        # Initialize results container
+        comparison_results = []
+        
+        # Compare each method
+        for method in methods:
+            self.logger.info(f"Evaluating clustering method: {method}")
+            
+            # Create configuration for this method
+            method_config = ClusteringConfig(
+                cluster_method=method,
+                n_clusters=n_clusters,
+                # Use other parameters from original config
+                return_periods=original_config.return_periods,
+                volatility_periods=original_config.volatility_periods,
+                volume_periods=original_config.volume_periods,
+                trend_periods=original_config.trend_periods,
+                autocorr_lags=original_config.autocorr_lags,
+                use_pca=original_config.use_pca,
+                pca_components=original_config.pca_components,
+                cache_results=False  # Disable caching for comparison
+            )
+            
+            # Update analyzer with this config
+            self.config = method_config
+            
+            try:
+                # Detect regimes
+                start_time = datetime.now()
+                regimes = self.detect_regimes(
+                    start_date=start_date,
+                    end_date=end_date,
+                    force_recompute=True
+                )
+                runtime = (datetime.now() - start_time).total_seconds()
+                
+                # Collect metrics
+                n_regimes = len(regimes)
+                regime_types = Counter([r.regime_type for r in regimes])
+                avg_duration = np.mean([(r.end_date - r.start_date).days for r in regimes]) if regimes else 0
+                
+                # Get cluster quality metrics
+                silhouette = getattr(self, 'silhouette_avg', None)
+                ch_score = getattr(self, 'ch_score', None)
+                
+                # Get average stability if available
+                if hasattr(self, 'cluster_stability'):
+                    stability = np.mean(list(self.cluster_stability.values()))
+                else:
+                    stability = None
+                
+                # Collect results
+                result = {
+                    'method': method,
+                    'n_regimes': n_regimes,
+                    'avg_duration_days': avg_duration,
+                    'regime_distribution': dict(regime_types),
+                    'silhouette_score': silhouette,
+                    'calinski_harabasz_score': ch_score,
+                    'stability_score': stability,
+                    'runtime_seconds': runtime
+                }
+                
+                comparison_results.append(result)
+                
+            except Exception as e:
+                self.logger.error(f"Error evaluating method {method}: {str(e)}")
+        
+        # Restore original config
+        self.config = original_config
+        
+        # Create comparison DataFrame
+        if comparison_results:
+            # Basic metrics
+            df_data = []
+            for result in comparison_results:
+                row = {
+                    'Method': result['method'],
+                    'Regimes Count': result['n_regimes'],
+                    'Avg Duration (days)': result['avg_duration_days'],
+                    'Runtime (sec)': result['runtime_seconds']
+                }
+                
+                # Add quality metrics if available
+                for metric in ['silhouette_score', 'calinski_harabasz_score', 'stability_score']:
+                    if result[metric] is not None:
+                        row[metric.replace('_', ' ').title()] = result[metric]
+                
+                # Add top regime types
+                if 'regime_distribution' in result and result['regime_distribution']:
+                    top_regimes = Counter(result['regime_distribution']).most_common(3)
+                    for i, (regime, count) in enumerate(top_regimes):
+                        row[f'Top Regime {i+1}'] = f"{regime} ({count})"
+                
+                df_data.append(row)
+            
+            comparison_df = pd.DataFrame(df_data)
+            
+            # Log results summary
+            self.logger.info(f"Comparison results summary:\n{comparison_df}")
+            
+            return comparison_df
+        else:
+            self.logger.warning("No comparison results available")
+            return pd.DataFrame()
+
+    def visualize_method_comparison(self, 
+                                comparison_df: pd.DataFrame,
+                                metrics: List[str] = None,
+                                filename: Optional[str] = None) -> None:
+        """
+        Visualize comparison of different clustering methods
+        
+        Args:
+            comparison_df (pd.DataFrame): Results from compare_clustering_methods
+            metrics (List[str]): Metrics to visualize
+            filename (Optional[str]): Output filename, if None displays plot
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            
+            if comparison_df.empty:
+                self.logger.warning("No comparison data to visualize")
+                return
+            
+            # Default metrics if none provided
+            if metrics is None:
+                metrics = ['Silhouette Score', 'Regimes Count', 'Avg Duration (days)']
+                # Add other metrics if available
+                for col in comparison_df.columns:
+                    if col in ['Calinski Harabasz Score', 'Stability Score'] and col not in metrics:
+                        metrics.append(col)
+            
+            # Filter metrics that exist in the DataFrame
+            valid_metrics = [m for m in metrics if m in comparison_df.columns]
+            
+            if not valid_metrics:
+                self.logger.warning(f"None of the requested metrics {metrics} are available in the comparison data")
+                return
+            
+            # Set up plotting
+            n_metrics = len(valid_metrics)
+            fig, axes = plt.subplots(n_metrics, 1, figsize=(10, 4 * n_metrics))
+            
+            # Handle single metric case
+            if n_metrics == 1:
+                axes = [axes]
+            
+            # Plot each metric
+            for i, metric in enumerate(valid_metrics):
+                ax = axes[i]
+                
+                # Sort by this metric
+                sorted_df = comparison_df.sort_values(by=metric)
+                
+                # Create bar colors
+                colors = plt.cm.viridis(np.linspace(0, 0.8, len(sorted_df)))
+                
+                # Create bar plot
+                sns.barplot(x='Method', y=metric, data=sorted_df, palette=colors, ax=ax)
+                
+                # Add value labels
+                for j, v in enumerate(sorted_df[metric]):
+                    ax.text(j, v + 0.01 * abs(v), f"{v:.2f}", ha='center')
+                
+                # Format axis
+                ax.set_title(f"{metric} by Clustering Method")
+                ax.set_xlabel('')
+                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+            
+            plt.tight_layout()
+            
+            # Save or display
+            if filename:
+                plt.savefig(filename, dpi=300, bbox_inches='tight')
+                self.logger.info(f"Saved method comparison visualization to {filename}")
+            else:
+                plt.show()
+        
+        except ImportError:
+            self.logger.warning("Could not visualize comparison. Matplotlib and seaborn required.")
+
+    def ensemble_clustering(self, 
+                        methods: List[str] = None,
+                        weights: Dict[str, float] = None,
+                        start_date: Optional[pd.Timestamp] = None,
+                        end_date: Optional[pd.Timestamp] = None) -> List[ClusteringMarketRegime]:
+        """
+        Perform ensemble clustering using multiple methods
+        
+        Args:
+            methods (List[str]): Clustering methods to use in ensemble
+            weights (Dict[str, float]): Weights for each method
+            start_date (Optional[pd.Timestamp]): Start date for analysis
+            end_date (Optional[pd.Timestamp]): End date for analysis
+            
+        Returns:
+            List[ClusteringMarketRegime]: Ensemble regimes
+        """
+        self.logger.info("Performing ensemble clustering")
+        
+        # Default methods if none provided
+        if methods is None:
+            methods = ['kmeans', 'gmm', 'hierarchical']
+        
+        # Store original config
+        original_config = self.config
+        
+        # Initialize containers
+        all_regimes = {}
+        all_clusters = {}
+        
+        # Run each clustering method
+        for method in methods:
+            self.logger.info(f"Running clustering method: {method}")
+            
+            # Create configuration for this method
+            method_config = ClusteringConfig(
+                cluster_method=method,
+                n_clusters=original_config.n_clusters,
+                # Use other parameters from original config
+                return_periods=original_config.return_periods,
+                volatility_periods=original_config.volatility_periods,
+                volume_periods=original_config.volume_periods,
+                trend_periods=original_config.trend_periods,
+                autocorr_lags=original_config.autocorr_lags,
+                use_pca=original_config.use_pca,
+                pca_components=original_config.pca_components,
+                cache_results=False  # Disable caching for ensemble
+            )
+            
+            # Update analyzer with this config
+            self.config = method_config
+            
+            try:
+                # Detect regimes
+                regimes = self.detect_regimes(
+                    start_date=start_date,
+                    end_date=end_date,
+                    force_recompute=True
+                )
+                
+                # Store results
+                all_regimes[method] = regimes
+                all_clusters[method] = self.cluster_labels.copy()
+                
+            except Exception as e:
+                self.logger.error(f"Error running method {method}: {str(e)}")
+        
+        # Restore original config
+        self.config = original_config
+        
+        # Check if we have results
+        if not all_regimes:
+            self.logger.warning("No clustering results available for ensemble")
+            return []
+        
+        # Calculate weights if not provided
+        if weights is None:
+            # Use equal weights by default
+            weights = {method: 1.0 / len(methods) for method in all_regimes.keys()}
+        else:
+            # Normalize weights
+            total = sum(weights.values())
+            weights = {k: v / total for k, v in weights.items()}
+        
+        # Create ensemble clustering
+        self.logger.info("Creating ensemble clustering")
+        
+        # Find common date range
+        common_dates = None
+        for method, clusters in all_clusters.items():
+            if common_dates is None:
+                common_dates = set(clusters.index)
+            else:
+                common_dates &= set(clusters.index)
+        
+        if not common_dates:
+            self.logger.warning("No common dates found across clustering methods")
+            return []
+        
+        # Convert common_dates to sorted list
+        common_dates = sorted(common_dates)
+        
+        # Create regime vote matrix
+        # For each date, each method "votes" for a regime type
+        regime_votes = {}
+        
+        for date in common_dates:
+            date_votes = {}
+            
+            for method, regimes in all_regimes.items():
+                # Find regime for this date
+                for regime in regimes:
+                    if regime.start_date <= date <= regime.end_date:
+                        regime_type = regime.regime_type
+                        if regime_type not in date_votes:
+                            date_votes[regime_type] = 0
+                        
+                        # Add weighted vote
+                        date_votes[regime_type] += weights.get(method, 1.0)
+                        break
+            
+            regime_votes[date] = date_votes
+        
+        # Find most voted regime for each date
+        ensemble_labels = {}
+        
+        for date, votes in regime_votes.items():
+            if votes:
+                # Find regime with highest vote
+                ensemble_labels[date] = max(votes.items(), key=lambda x: x[1])[0]
+            else:
+                # Default to undefined if no votes
+                ensemble_labels[date] = 'undefined'
+        
+        # Create continuous regime segments
+        ensemble_segments = []
+        current_regime = None
+        start_date = None
+        
+        for date in common_dates:
+            regime_type = ensemble_labels.get(date)
+            
+            if regime_type != current_regime:
+                # End previous segment
+                if current_regime is not None and start_date is not None:
+                    ensemble_segments.append({
+                        'regime_type': current_regime,
+                        'start_date': start_date,
+                        'end_date': date - pd.Timedelta(days=1)
+                    })
+                
+                # Start new segment
+                current_regime = regime_type
+                start_date = date
+        
+        # Add final segment
+        if current_regime is not None and start_date is not None:
+            ensemble_segments.append({
+                'regime_type': current_regime,
+                'start_date': start_date,
+                'end_date': common_dates[-1]
+            })
+        
+        # Convert segments to regime objects
+        ensemble_regimes = []
+        
+        for i, segment in enumerate(ensemble_segments):
+            # Calculate regime characteristics
+            regime_data = self.df[segment['start_date']:segment['end_date']]
+            
+            if len(regime_data) < 2:
+                continue
+            
+            # Determine trend
+            price_change = regime_data['Close'].iloc[-1] / regime_data['Close'].iloc[0] - 1
+            if price_change > 0.05:
+                trend = 'bullish'
+            elif price_change < -0.05:
+                trend = 'bearish'
+            else:
+                trend = 'neutral'
+            
+            # Determine volatility
+            returns = regime_data['Close'].pct_change().dropna()
+            vol = returns.std() * np.sqrt(252)
+            if vol < 0.10:
+                volatility = 'low'
+            elif vol > 0.25:
+                volatility = 'high'
+            else:
+                volatility = 'medium'
+            
+            # Determine volume trend if available
+            if 'Volume' in regime_data:
+                vol_change = regime_data['Volume'].iloc[-1] / regime_data['Volume'].iloc[0] - 1
+                if vol_change > 0.20:
+                    volume = 'increasing'
+                elif vol_change < -0.20:
+                    volume = 'decreasing'
+                else:
+                    volume = 'stable'
+            else:
+                volume = 'unknown'
+            
+            # Create ensemble regime
+            ensemble_regime = ClusteringMarketRegime(
+                regime_type=segment['regime_type'],
+                volatility=volatility,
+                trend=trend,
+                volume=volume,
+                start_date=segment['start_date'],
+                end_date=segment['end_date'],
+                confidence=0.8,  # Default confidence for ensemble
+                cluster_id=i,    # Use sequence as cluster ID
+                stability_score=0.7,  # Default stability for ensemble
+                expected_duration=None  # No expected duration for ensemble
+            )
+            
+            ensemble_regimes.append(ensemble_regime)
+        
+        # Update regimes in analyzer
+        self.regimes = ensemble_regimes
+        
+        self.logger.info(f"Created {len(ensemble_regimes)} ensemble regimes")
+        return ensemble_regimes
