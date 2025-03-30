@@ -2586,13 +2586,6 @@ class ClusteringMarketRegimeAnalyzer:
         except ImportError:
             self.logger.warning("Could not plot regime timeline. matplotlib required.")
             
-    """
-Enhanced features for ClusteringMarketRegimeAnalyzer:
-1. Model validation
-2. Hyperparameter optimization
-3. Comparative analysis
-"""
-
     def validate_model(self, 
                     test_start_date: Optional[pd.Timestamp] = None,
                     test_end_date: Optional[pd.Timestamp] = None,
