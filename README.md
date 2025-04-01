@@ -198,10 +198,10 @@ A comprehensive Python library for financial technical analysis and visualizatio
 
 ```python
 # Basic installation
-pip install specialized-viz
+pip install patternforge
 
 # Full installation with all models
-pip install specialized-viz[all]
+pip install patternforge[all]
 ```
 
 ## Quick Start
